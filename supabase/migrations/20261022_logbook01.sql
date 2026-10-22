@@ -83,3 +83,13 @@ $$;
 revoke all on function public.logbook_check_pin(text,text) from public, anon, authenticated;
 grant execute on function public.logbook_check_pin(text,text) to service_role;
 -- ROLLBACK also: drop function if exists public.logbook_check_pin(text,text);
+
+-- 02 (22/10, Max: "fare scegliere il PIN"): the initial PIN works once; at first sign-in each person chooses their own.
+alter table public.logbook_people add column pin_chosen boolean not null default false;
+create or replace function public.logbook_set_pin(p_id int, p_pin text) returns void
+language sql security definer set search_path = '' as $$
+  update public.logbook_people set pin_hash = extensions.crypt(p_pin, extensions.gen_salt('bf',8)), pin_chosen = true where id = p_id
+$$;
+revoke all on function public.logbook_set_pin(int,text) from public, anon, authenticated;
+grant execute on function public.logbook_set_pin(int,text) to service_role;
+-- ROLLBACK also: drop function if exists public.logbook_set_pin(int,text); alter table public.logbook_people drop column pin_chosen;

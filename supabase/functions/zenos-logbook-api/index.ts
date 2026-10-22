@@ -4,7 +4,7 @@
 import 'jsr:@supabase/functions-js/edge-runtime.d.ts'
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 
-const BUILD = 'logbook-1.0'
+const BUILD = 'logbook-1.1'
 const ORIGINS = ['https://1cos.github.io', 'http://localhost:8793', 'http://127.0.0.1:8793']
 const svc = createClient(Deno.env.get('SUPABASE_URL') ?? '', Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '', { auth: { persistSession: false } })
 const BUCKET = 'logbook-photos'
@@ -28,9 +28,9 @@ async function auth(req: Request) {
   if (!/^[0-9a-f]{64}$/.test(tok)) throw new HttpError(401, 'unauthorized')
   const s = must(await svc.from('logbook_sessions').select('id,person_id,expires_at,revoked_at').eq('token_hash', await sha256hex(tok)).maybeSingle()) as any
   if (!s || s.revoked_at || new Date(s.expires_at) <= new Date()) throw new HttpError(401, 'session_expired')
-  const p = must(await svc.from('logbook_people').select('id,name,active').eq('id', s.person_id).maybeSingle()) as any
+  const p = must(await svc.from('logbook_people').select('id,name,active,pin_chosen').eq('id', s.person_id).maybeSingle()) as any
   if (!p || !p.active) throw new HttpError(401, 'unauthorized')
-  return { id: p.id as number, name: p.name as string, session: s.id as string }
+  return { id: p.id as number, name: p.name as string, session: s.id as string, pinChosen: !!p.pin_chosen }
 }
 
 async function login(req: Request, b: any) {
@@ -52,7 +52,8 @@ async function login(req: Request, b: any) {
   if (!id) return fail(p.id)
   const tok = Array.from(crypto.getRandomValues(new Uint8Array(32))).map(x => x.toString(16).padStart(2, '0')).join('')
   must(await svc.from('logbook_sessions').insert({ person_id: id, token_hash: await sha256hex(tok), expires_at: new Date(Date.now() + 180 * 86400_000).toISOString() }))
-  return { ok: true, token: tok, name }
+  const pc = must(await svc.from('logbook_people').select('pin_chosen').eq('id', id).maybeSingle()) as any
+  return { ok: true, token: tok, name, choosePin: !pc?.pin_chosen }
 }
 
 async function state() {
@@ -106,6 +107,28 @@ async function addComment(u: { id: number }, b: any) {
   must(await svc.from('logbook_comments').insert({ entry_id: entry, person_id: u.id, body }))
   return { ok: true }
 }
+// a PIN anyone could guess is refused: same digit 4 times, straight runs up or down
+function weakPin(p: string) {
+  if (/^(\d)\1{3}$/.test(p)) return true
+  const d = p.split('').map(Number)
+  const step = d[1] - d[0]
+  return (step === 1 || step === -1) && d.every((x, i) => i === 0 || x - d[i - 1] === step)
+}
+async function setPin(u: { id: number; name: string }, b: any) {
+  const cur = b?.current, neu = b?.pin
+  if (typeof neu !== 'string' || !/^\d{4}$/.test(neu)) throw new HttpError(400, 'pin_format')
+  if (weakPin(neu)) throw new HttpError(400, 'pin_weak')
+  if (typeof cur !== 'string' || !/^\d{4}$/.test(cur)) throw new HttpError(400, 'pin_current')
+  // wrong current PINs count toward the same 5-in-15-minutes lock as sign-in
+  const since = new Date(Date.now() - 15 * 60_000).toISOString()
+  const { count } = await svc.from('logbook_login_fails').select('id', { count: 'exact', head: true }).eq('person_id', u.id).gte('at', since)
+  if ((count ?? 0) >= 5) throw new HttpError(429, 'locked')
+  const id = must(await svc.rpc('logbook_check_pin', { p_name: u.name, p_pin: cur })) as number | null
+  if (id !== u.id) { await svc.from('logbook_login_fails').insert({ person_id: u.id, ip_hash: 'set_pin' }); throw new HttpError(400, 'pin_current') }
+  if (cur === neu) throw new HttpError(400, 'pin_same')
+  must(await svc.rpc('logbook_set_pin', { p_id: u.id, p_pin: neu }))
+  return { ok: true }
+}
 async function addTopic(u: { id: number }, b: any) {
   const name = clean(b?.name, 40)
   if (!name) throw new HttpError(400, 'empty')
@@ -126,7 +149,8 @@ Deno.serve(async req => {
     else {
       const u = await auth(req)
       switch (b.op) {
-        case 'state': out = { me: u.name, ...(await state()) }; break
+        case 'state': out = { me: u.name, choosePin: !u.pinChosen, ...(await state()) }; break
+        case 'set_pin': out = await setPin(u, b); break
         case 'add_entry': out = await addEntry(u, b); break
         case 'add_comment': out = await addComment(u, b); break
         case 'add_topic': out = await addTopic(u, b); break

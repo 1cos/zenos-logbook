@@ -1,7 +1,8 @@
-// Live UI test on a local copy (port 8793): sign in as Max, write one entry with photo + one comment, check they show, then the caller deletes them.
+// Live UI test on a local copy (port 8793): sign in as a temporary test person (LB_WHO, LB_PIN), write one entry with photo + one comment, check they show; the caller deletes the test person and data.
 import { webkit, chromium } from '/Users/massimilianozubboli/cw-probe/node_modules/playwright-core/index.mjs'
 import fs from 'node:fs'
-const pin = fs.readFileSync(process.env.HOME + '/.brigade_secrets/zenos_logbook_pins.txt', 'utf8').match(/^Max: (\d{4})/m)[1]
+// test person and PIN come from the environment (a temporary person, never a real one)
+const WHO = process.env.LB_WHO, pin = process.env.LB_PIN
 const shots = process.argv[2]
 let pass = 0, fail = 0
 const ok = (c, m) => { c ? pass++ : fail++; console.log((c ? 'PASS ' : 'FAIL ') + m) }
@@ -10,7 +11,7 @@ for (const [bn, B] of [['webkit', webkit], ['chromium', chromium]]) {
   const pg = await br.newPage({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2 })
   const errs = []; pg.on('pageerror', e => errs.push(e.message))
   await pg.goto('http://127.0.0.1:8793/')
-  await pg.getByRole('button', { name: 'Max' }).click()
+  await pg.getByRole('button', { name: WHO }).click()
   await pg.getByRole('button', { name: '0', exact: true }).waitFor()
   // wrong PIN first
   for (const d of '0000') await pg.locator(`[data-n="${d}"]`).click()

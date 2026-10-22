@@ -1,6 +1,6 @@
 {
   "name": "Zeno's Logbook",
-  "short_name": "Logbook",
+  "short_name": "Zeno's Logbook",
   "description": "Zeno's on the Square shared daily logbook",
   "start_url": "./",
   "scope": "./",
