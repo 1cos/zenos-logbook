@@ -141,13 +141,13 @@ const topic=k=>S.topics.find(t=>t.id===k);
 async function showLogin(){
   document.getElementById("whoBtn").hidden=true;closePane();
   const A=document.getElementById("app");A.innerHTML=`<div class="loading">Loading…</div>`;
-  let people=[];try{people=(await call("people")).people}catch(e){A.innerHTML=`<div class="login"><p>No connection. Check the internet and try again.</p><button class="primary" onclick="showLogin()">Try again</button></div>`;return}
+  let people=[],firstTime=[];try{const r=await call("people");people=r.people;firstTime=r.firstTime||[]}catch(e){A.innerHTML=`<div class="login"><p>No connection. Check the internet and try again.</p><button class="primary" onclick="showLogin()">Try again</button></div>`;return}
   let who=null,pin="";
   const draw=(err="")=>{A.innerHTML=who?`<div class="login"><h2>Hi ${esc(who)}</h2><p>Enter your 4-digit PIN.</p>
       <div class="dots">${[0,1,2,3].map(i=>`<i class="${i<pin.length?"on":""}"></i>`).join("")}</div><p class="err">${err}</p>
       <div class="pad">${[1,2,3,4,5,6,7,8,9].map(n=>`<button data-n="${n}">${n}</button>`).join("")}<button data-back="1" aria-label="Back">‹</button><button data-n="0">0</button><button data-del="1" aria-label="Delete">⌫</button></div></div>`
     :`<div class="login"><h2>Who are you?</h2><div class="people">${people.map(p=>`<button class="secondary" data-p="${esc(p)}">${esc(p)}</button>`).join("")}</div></div>`;
-    A.querySelectorAll("[data-p]").forEach(b=>b.onclick=()=>{who=b.dataset.p;pin="";draw()});
+    A.querySelectorAll("[data-p]").forEach(b=>b.onclick=()=>{if(firstTime.includes(b.dataset.p))return firstPin(b.dataset.p);who=b.dataset.p;pin="";draw()});
     A.querySelectorAll("[data-n]").forEach(b=>b.onclick=()=>{if(pin.length<4){pin+=b.dataset.n;draw();if(pin.length===4)go()}});
     const d=A.querySelector("[data-del]");if(d)d.onclick=()=>{pin=pin.slice(0,-1);draw()};
     const bk=A.querySelector("[data-back]");if(bk)bk.onclick=()=>{who=null;pin="";draw()};
@@ -155,6 +155,33 @@ async function showLogin(){
   const go=async()=>{try{const r=await call("login",{name:who,pin});
       if(r.ok){setToken(r.token);const had=pin;pin="";if(r.choosePin)return choosePin(had,true);await load()}else{pin="";draw(r.locked?"Too many tries. Wait 15 minutes.":"Wrong PIN. Try again.")}}
     catch(e){pin="";draw("No connection. Try again.")}};
+  draw();
+}
+
+/* ---------- first sign-in: create your PIN right away (1.2) ---------- */
+function firstPin(name){
+  const A=document.getElementById("app");
+  let step="new",neu="",pin="";
+  const title={new:`Hi ${esc(name)}`,again:"Type it again"};
+  const sub={new:"First time here: choose your own 4-digit PIN. Pick digits only you know.",again:"To be sure it is right."};
+  const draw=(err="")=>{A.innerHTML=`<div class="login"><h2>${title[step]}</h2><p>${sub[step]}</p>
+      <div class="dots">${[0,1,2,3].map(i=>`<i class="${i<pin.length?"on":""}"></i>`).join("")}</div><p class="err">${err}</p>
+      <div class="pad">${[1,2,3,4,5,6,7,8,9].map(n=>`<button data-n="${n}">${n}</button>`).join("")}<button data-back="1" aria-label="Back">‹</button><button data-n="0">0</button><button data-del="1" aria-label="Delete">⌫</button></div></div>`;
+    A.querySelectorAll("[data-n]").forEach(b=>b.onclick=()=>{if(pin.length<4){pin+=b.dataset.n;draw();if(pin.length===4)next()}});
+    A.querySelector("[data-del]").onclick=()=>{pin=pin.slice(0,-1);draw()};
+    A.querySelector("[data-back]").onclick=()=>showLogin();
+  };
+  const weak=p=>/^(\d)\1{3}$/.test(p)||[1,-1].some(k=>[1,2,3].every(i=>p[i]-p[i-1]===k));
+  const next=async()=>{
+    if(step==="new"){if(weak(pin)){pin="";return draw("Too easy to guess. Try different digits.")}
+      neu=pin;pin="";step="again";return draw()}
+    if(pin!==neu){pin="";neu="";step="new";return draw("The two PINs were different. Start again.")}
+    pin="";
+    try{const r=await call("claim_pin",{name,pin:neu});setToken(r.token);toast("Your PIN is saved");await load()}
+    catch(e){neu="";step="new";
+      if(e.message==="pin_already_chosen"){A.innerHTML=`<div class="login"><h2>${esc(name)} already has a PIN</h2><p>Sign in with it. If it was not you, tell Max.</p><button class="primary" id="okb">OK</button></div>`;document.getElementById("okb").onclick=()=>showLogin();return}
+      draw(e.message==="offline"?"No connection. Try again.":"Could not save. Try again.")}
+  };
   draw();
 }
 

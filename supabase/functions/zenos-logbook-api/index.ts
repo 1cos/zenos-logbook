@@ -4,7 +4,7 @@
 import 'jsr:@supabase/functions-js/edge-runtime.d.ts'
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 
-const BUILD = 'logbook-1.1'
+const BUILD = 'logbook-1.2'
 const ORIGINS = ['https://1cos.github.io', 'http://localhost:8793', 'http://127.0.0.1:8793']
 const svc = createClient(Deno.env.get('SUPABASE_URL') ?? '', Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '', { auth: { persistSession: false } })
 const BUCKET = 'logbook-photos'
@@ -50,10 +50,29 @@ async function login(req: Request, b: any) {
   if (typeof pin !== 'string' || !/^\d{4}$/.test(pin)) return fail(p.id)
   const id = must(await svc.rpc('logbook_check_pin', { p_name: name, p_pin: pin })) as number | null
   if (!id) return fail(p.id)
-  const tok = Array.from(crypto.getRandomValues(new Uint8Array(32))).map(x => x.toString(16).padStart(2, '0')).join('')
-  must(await svc.from('logbook_sessions').insert({ person_id: id, token_hash: await sha256hex(tok), expires_at: new Date(Date.now() + 180 * 86400_000).toISOString() }))
+  const tok = await newSession(id)
   const pc = must(await svc.from('logbook_people').select('pin_chosen').eq('id', id).maybeSingle()) as any
   return { ok: true, token: tok, name, choosePin: !pc?.pin_chosen }
+}
+async function newSession(personId: number) {
+  const tok = Array.from(crypto.getRandomValues(new Uint8Array(32))).map(x => x.toString(16).padStart(2, '0')).join('')
+  must(await svc.from('logbook_sessions').insert({ person_id: personId, token_hash: await sha256hex(tok), expires_at: new Date(Date.now() + 180 * 86400_000).toISOString() }))
+  return tok
+}
+
+// 1.2 (Max 24/10: "entrino scegliendo il loro PIN già da subito"): a person who has never chosen a PIN
+// creates it at first sign-in, no initial PIN. Once chosen, the name is taken: from then on only name + PIN.
+async function claimPin(b: any) {
+  const name = clean(b?.name, 40), pin = b?.pin
+  if (typeof pin !== 'string' || !/^\d{4}$/.test(pin)) throw new HttpError(400, 'pin_format')
+  if (weakPin(pin)) throw new HttpError(400, 'pin_weak')
+  // take the name in one step: only one request can flip pin_chosen from false to true
+  const got = must(await svc.from('logbook_people').update({ pin_chosen: true }).eq('name', name).eq('active', true).eq('pin_chosen', false).select('id')) as any[]
+  if (!got.length) throw new HttpError(409, 'pin_already_chosen')
+  const id = got[0].id as number
+  const r = await svc.rpc('logbook_set_pin', { p_id: id, p_pin: pin })
+  if (r.error) { await svc.from('logbook_people').update({ pin_chosen: false }).eq('id', id); throw r.error }
+  return { ok: true, token: await newSession(id), name }
 }
 
 async function state() {
@@ -144,8 +163,12 @@ Deno.serve(async req => {
   try {
     const b = await req.json().catch(() => ({}))
     let out: unknown
-    if (b.op === 'people') out = { build: BUILD, people: (must(await svc.from('logbook_people').select('name').eq('active', true).order('id')) as any[]).map(p => p.name) }
+    if (b.op === 'people') {
+      const ps = must(await svc.from('logbook_people').select('name,pin_chosen').eq('active', true).order('id')) as any[]
+      out = { build: BUILD, people: ps.map(p => p.name), firstTime: ps.filter(p => !p.pin_chosen).map(p => p.name) }
+    }
     else if (b.op === 'login') out = await login(req, b)
+    else if (b.op === 'claim_pin') out = await claimPin(b)
     else {
       const u = await auth(req)
       switch (b.op) {
