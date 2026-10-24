@@ -94,6 +94,8 @@ textarea{min-height:100px;resize:vertical}
 
 /* sign in */
 .login{max-width:420px;margin:8vh auto 0;display:grid;gap:16px;background:var(--glass);border:1px solid var(--glass-edge);border-radius:28px;padding:24px 20px;box-shadow:var(--shadow),inset 0 1px 0 rgba(255,255,255,.9);-webkit-backdrop-filter:var(--blur);backdrop-filter:var(--blur)}
+.mine{display:flex;gap:8px}.mine button{flex:1}
+.danger{color:#b42318!important;border-color:#b42318!important}
 .login h2{font-family:var(--f-disp);text-transform:uppercase;font-size:24px;margin:0;letter-spacing:.02em}
 .login p{margin:0;color:var(--muted);font-size:14px}
 .dots{display:flex;justify-content:center;gap:14px;padding:6px 0}
@@ -126,7 +128,11 @@ function dayName(k){const today=dayOf(new Date().toISOString());const y=new Date
 const money=n=>"$"+Number(n).toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2});
 function toast(m){const el=document.createElement("div");el.className="toast";el.textContent=m;document.body.appendChild(el);setTimeout(()=>el.remove(),1800)}
 function token(){try{return localStorage.getItem(TK)||""}catch(e){return ""}}
-function setToken(t){try{t?localStorage.setItem(TK,t):localStorage.removeItem(TK)}catch(e){}}
+function setToken(t){try{t?localStorage.setItem(TK,t):(localStorage.removeItem(TK),localStorage.removeItem(CK))}catch(e){}}
+/* 1.3: the last logbook seen stays on the phone, so the app opens at once and refreshes in the background */
+const CK="zenos_logbook_cache";
+function keep(st){S=st;try{localStorage.setItem(CK,JSON.stringify(st))}catch(e){}}
+function cached(){try{return JSON.parse(localStorage.getItem(CK)||"null")}catch(e){return null}}
 async function call(op,data={}){
   const h={"Content-Type":"application/json"};const t=token();if(t)h.Authorization="Bearer "+t;
   let r;try{r=await fetch(API,{method:"POST",headers:h,body:JSON.stringify({op,...data})})}catch(e){throw new Error("offline")}
@@ -219,11 +225,12 @@ function choosePin(current,first){
 /* ---------- data ---------- */
 async function load(quiet){
   if(busy)return;busy=true;
-  try{const st=await call("state");if(st.choosePin){S=null;busy=false;return choosePin("",true)}S=st;if(!topic(tab))tab=S.topics[0]?.id;render()}
+  try{const st=await call("state");if(st.choosePin){S=null;busy=false;return choosePin("",true)}show(st)}
   catch(e){if(e.message==="offline"){if(!S)document.getElementById("app").innerHTML=`<div class="login"><p>No connection. Check the internet and try again.</p><button class="primary" onclick="load()">Try again</button></div>`;else if(!quiet)toast("No connection")}}
   finally{busy=false}
 }
 
+function show(st){keep(st);if(!topic(tab))tab=S.topics[0]?.id;if(!document.querySelector("#layer .pane"))render()}
 function render(){
   if(!S)return;
   const W=document.getElementById("whoBtn");W.hidden=false;W.textContent=S.me;
@@ -238,16 +245,16 @@ function render(){
     ${list.length?Object.keys(groups).map(d=>`<div class="daygrp"><div class="dayh">${dayName(d)}</div>${groups[d].map(e=>`
       <button class="row" data-id="${e.id}"><span class="t">${hm(e.at)}</span><span class="b">
         <span class="txt">${esc(e.txt)}</span>${e.photo?`<img class="thumb" src="${esc(e.photo)}" alt="" loading="lazy">`:""}
-        <span class="meta">${esc(e.who)}${e.amount!=null?" · "+money(e.amount):""}${e.comments.length?" · "+e.comments.length+(e.comments.length==1?" comment":" comments"):""}</span></span></button>`).join("")}</div>`).join("")
+        <span class="meta">${esc(e.who)}${e.amount!=null?" · "+money(e.amount):""}${e.edited?" · edited":""}${e.comments.length?" · "+e.comments.length+(e.comments.length==1?" comment":" comments"):""}</span></span></button>`).join("")}</div>`).join("")
     :`<div class="empty">${s?"Nothing matches.":"Nothing written in "+esc(T.name)+" yet.<br>Tap “+ Add entry” to write the first one."}</div>`}</section>`;
   const qi=document.getElementById("q");qi.oninput=()=>{q=qi.value;const p=qi.selectionStart;render();const n=document.getElementById("q");n.focus();n.setSelectionRange(p,p)};
 }
 function pane(html){document.getElementById("layer").innerHTML=`<div class="scrim" id="scrim"><div class="pane" role="dialog" aria-modal="true">${html}</div></div>`;
   document.getElementById("scrim").addEventListener("click",e=>{if(e.target.id==="scrim"||e.target.closest(".x"))closePane()})}
 function closePane(){document.getElementById("layer").innerHTML=""}
-function failMsg(e){return e.message==="offline"?"No connection. Nothing was saved, try again.":e.message==="signed_out"?"Please sign in again.":"Could not save. Try again."}
+function failMsg(e){return e.message==="has_comments"?"Others commented on it: you can edit it, not delete it.":e.message==="offline"?"No connection. Nothing was saved, try again.":e.message==="signed_out"?"Please sign in again.":"Could not save. Try again."}
 async function send(btn,op,data,okMsg){btn.disabled=true;const old=btn.textContent;btn.textContent="Saving…";
-  try{await call(op,data);toast(okMsg);return true}catch(e){if(e.message!=="signed_out")toast(failMsg(e));btn.disabled=false;btn.textContent=old;return false}}
+  try{const r=await call(op,data);if(r.state)keep(r.state);toast(okMsg);return true}catch(e){if(e.message!=="signed_out")toast(failMsg(e));btn.disabled=false;btn.textContent=old;return false}}
 
 function addEntry(){const T=topic(tab);let photo=null;
   pane(`<h3>${esc(T.name)}<button class="x" aria-label="Close">×</button></h3>
@@ -260,25 +267,44 @@ function addEntry(){const T=topic(tab);let photo=null;
     const s=Math.min(1,1200/Math.max(img.width,img.height));const cv=document.createElement("canvas");cv.width=Math.round(img.width*s);cv.height=Math.round(img.height*s);cv.getContext("2d").drawImage(img,0,0,cv.width,cv.height);
     photo=cv.toDataURL("image/jpeg",.75);document.getElementById("fileT").textContent="Photo added ✓"};img.src=r.result};r.readAsDataURL(f)};
   document.getElementById("save").onclick=async e=>{const a=document.getElementById("amt");
-    if(await send(e.target,"add_entry",{topic:tab,text:tx.value.trim(),amount:a&&a.value!==""?a.value:null,photo},"Saved")){closePane();q="";await load()}};
+    if(await send(e.target,"add_entry",{topic:tab,text:tx.value.trim(),amount:a&&a.value!==""?a.value:null,photo},"Saved")){closePane();q="";render()}};
 }
 function openEntry(eid){const e=S.entries.find(x=>x.id===eid);if(!e)return;
   const when=iso=>new Date(iso).toLocaleDateString("en-US",{month:"short",day:"numeric"})+", "+hm(iso);
   pane(`<h3>${esc(topic(e.topic).name)}<button class="x" aria-label="Close">×</button></h3>
     <div class="big">${esc(e.txt)}</div>${e.photo?`<img class="thumb" style="max-height:340px" src="${esc(e.photo)}" alt="">`:""}
-    <div class="meta">${esc(e.who)} · ${when(e.at)}${e.amount!=null?" · "+money(e.amount):""}</div>
+    <div class="meta">${esc(e.who)} · ${when(e.at)}${e.amount!=null?" · "+money(e.amount):""}${e.edited?" · edited "+when(e.edited):""}</div>
+    ${e.mine?`<div class="mine"><button class="secondary" id="eEdit">Edit</button><button class="secondary" id="eDel">Delete</button></div>`:""}
     <div><div class="lbl">Comments</div><div class="comments">${e.comments.length?e.comments.map(c=>`<div class="cm">${esc(c.txt)}<small>${esc(c.who)} · ${when(c.at)}</small></div>`).join(""):`<div class="meta">No comments yet.</div>`}</div></div>
     <textarea id="c" maxlength="2000" style="min-height:70px" placeholder="Add a comment…"></textarea>
     <button class="primary" id="cSave" disabled>Add comment</button>`);
   const c=document.getElementById("c");c.oninput=()=>document.getElementById("cSave").disabled=!c.value.trim();
-  document.getElementById("cSave").onclick=async ev=>{if(await send(ev.target,"add_comment",{entry:eid,text:c.value.trim()},"Comment added")){await load();openEntry(eid)}};
+  document.getElementById("cSave").onclick=async ev=>{if(await send(ev.target,"add_comment",{entry:eid,text:c.value.trim()},"Comment added")){render();openEntry(eid)}};
+  if(!e.mine)return;
+  document.getElementById("eEdit").onclick=()=>editEntry(eid);
+  /* delete asks twice on the same button: no browser pop-up */
+  document.getElementById("eDel").onclick=async ev=>{const b=ev.target;
+    if(!b.dataset.sure){b.dataset.sure="1";b.textContent="Tap again to delete";b.classList.add("danger");return}
+    if(await send(b,"delete_entry",{entry:eid},"Deleted")){closePane();render()}
+    else{delete b.dataset.sure;b.textContent="Delete";b.classList.remove("danger")}};
+}
+function editEntry(eid){const e=S.entries.find(x=>x.id===eid);if(!e)return;const T=topic(e.topic);
+  pane(`<h3>Edit · ${esc(T.name)}<button class="x" aria-label="Close">×</button></h3>
+    <div><div class="lbl">What happened?</div><textarea id="txt" maxlength="4000"></textarea></div>
+    ${T.amount?`<div><div class="lbl">Amount $ (optional)</div><input class="field" id="amt" type="number" inputmode="decimal" step="0.01" min="0" placeholder="0.00"></div>`:""}
+    <p class="meta" style="margin:0">Everyone will see that it was edited.</p>
+    <button class="primary" id="save">Save changes</button>`);
+  const tx=document.getElementById("txt"),a=document.getElementById("amt");tx.value=e.txt;if(a&&e.amount!=null)a.value=e.amount;tx.focus();
+  tx.oninput=()=>document.getElementById("save").disabled=!tx.value.trim();
+  document.getElementById("save").onclick=async ev=>{
+    if(await send(ev.target,"edit_entry",{entry:eid,text:tx.value.trim(),amount:a&&a.value!==""?a.value:null},"Saved")){render();openEntry(eid)}};
 }
 function addTopic(){pane(`<h3>New topic<button class="x" aria-label="Close">×</button></h3>
     <div><div class="lbl">Name</div><input class="field" id="tn" maxlength="24" placeholder="e.g. Health inspections"></div>
     <p class="meta" style="margin:0">Everyone will see the new topic.</p>
     <button class="primary" id="tSave" disabled>Add topic</button>`);
   const tn=document.getElementById("tn");tn.focus();tn.oninput=()=>document.getElementById("tSave").disabled=!tn.value.trim();
-  document.getElementById("tSave").onclick=async ev=>{ev.target.disabled=true;try{const r=await call("add_topic",{name:tn.value.trim()});tab=r.id;q="";closePane();toast("Topic added");await load()}catch(e){if(e.message!=="signed_out")toast(failMsg(e));ev.target.disabled=false}}}
+  document.getElementById("tSave").onclick=async ev=>{ev.target.disabled=true;try{const r=await call("add_topic",{name:tn.value.trim()});if(r.state)keep(r.state);tab=r.id;q="";closePane();toast("Topic added");render()}catch(e){if(e.message!=="signed_out")toast(failMsg(e));ev.target.disabled=false}}}
 function account(){if(!S)return;pane(`<h3>${esc(S.me)}<button class="x" aria-label="Close">×</button></h3>
     <p class="meta" style="margin:0">Signed in on this phone. Sign out if this phone is shared.</p>
     <button class="secondary" id="chg">Change PIN</button><button class="secondary" id="out">Sign out</button>`);
@@ -296,7 +322,7 @@ document.addEventListener("click",e=>{
 document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible"&&S&&!document.querySelector("#layer .pane"))load(true)});
 setInterval(()=>{if(document.visibilityState==="visible"&&S&&!document.querySelector("#layer .pane"))load(true)},120000);
 if("serviceWorker" in navigator)navigator.serviceWorker.register("sw.js").catch(()=>{});
-token()?load():showLogin();
+if(token()){const c=cached();if(c&&c.topics&&c.topics.length){S=c;tab=S.topics[0].id;render();load(true)}else load()}else showLogin();
 </script>
 </body>
 </html>

@@ -4,7 +4,7 @@
 import 'jsr:@supabase/functions-js/edge-runtime.d.ts'
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 
-const BUILD = 'logbook-1.2'
+const BUILD = 'logbook-1.3'
 const ORIGINS = ['https://1cos.github.io', 'http://localhost:8793', 'http://127.0.0.1:8793']
 const svc = createClient(Deno.env.get('SUPABASE_URL') ?? '', Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '', { auth: { persistSession: false } })
 const BUCKET = 'logbook-photos'
@@ -75,24 +75,27 @@ async function claimPin(b: any) {
   return { ok: true, token: await newSession(id), name }
 }
 
-async function state() {
-  const topics = must(await svc.from('logbook_topics').select('id,name,hint,has_amount,sort,created_at').order('sort').order('created_at')) as any[]
-  const people = must(await svc.from('logbook_people').select('id,name')) as any[]
+// 1.3: the reads run side by side (they used to run one after the other)
+async function state(meId: number) {
+  const [topics, people, entries] = await Promise.all([
+    svc.from('logbook_topics').select('id,name,hint,has_amount,sort,created_at').order('sort').order('created_at').then(must),
+    svc.from('logbook_people').select('id,name').then(must),
+    svc.from('logbook_entries').select('id,topic_id,person_id,body,amount,photo_path,created_at,edited_at').order('created_at', { ascending: false }).limit(1500).then(must),
+  ]) as any[][]
   const pn = Object.fromEntries(people.map(p => [p.id, p.name]))
-  const entries = must(await svc.from('logbook_entries').select('id,topic_id,person_id,body,amount,photo_path,created_at').order('created_at', { ascending: false }).limit(1500)) as any[]
   const ids = entries.map(e => e.id)
-  const comments = ids.length ? must(await svc.from('logbook_comments').select('id,entry_id,person_id,body,created_at').in('entry_id', ids).order('created_at')) as any[] : []
   const paths = entries.filter(e => e.photo_path).map(e => e.photo_path)
+  const [comments, signed] = await Promise.all([
+    ids.length ? svc.from('logbook_comments').select('id,entry_id,person_id,body,created_at').in('entry_id', ids).order('created_at').then(must) : [],
+    paths.length ? svc.storage.from(BUCKET).createSignedUrls(paths, 6 * 3600).then(must) : [],
+  ]) as any[][]
   const urls: Record<string, string> = {}
-  if (paths.length) {
-    const r = must(await svc.storage.from(BUCKET).createSignedUrls(paths, 6 * 3600)) as any[]
-    r.forEach(x => { if (x.signedUrl) urls[x.path] = x.signedUrl })
-  }
+  signed.forEach(x => { if (x.signedUrl) urls[x.path] = x.signedUrl })
   return {
     topics: topics.map(t => ({ id: t.id, name: t.name, hint: t.hint || '', amount: t.has_amount })),
     entries: entries.map(e => ({
-      id: e.id, topic: e.topic_id, who: pn[e.person_id] || '?', txt: e.body, amount: e.amount === null ? null : Number(e.amount), at: e.created_at,
-      photo: e.photo_path ? urls[e.photo_path] || null : null,
+      id: e.id, topic: e.topic_id, who: pn[e.person_id] || '?', mine: e.person_id === meId, txt: e.body, amount: e.amount === null ? null : Number(e.amount), at: e.created_at,
+      edited: e.edited_at || null, photo: e.photo_path ? urls[e.photo_path] || null : null,
       comments: comments.filter(c => c.entry_id === e.id).map(c => ({ id: c.id, who: pn[c.person_id] || '?', txt: c.body, at: c.created_at })),
     })),
   }
@@ -126,6 +129,39 @@ async function addComment(u: { id: number }, b: any) {
   must(await svc.from('logbook_comments').insert({ entry_id: entry, person_id: u.id, body }))
   return { ok: true }
 }
+// 1.3 (Max 24/10): the author can change or delete their own entry. Changed entries show "edited".
+async function ownEntry(u: { id: number }, b: any) {
+  const id = clean(b?.entry, 40)
+  if (!/^[0-9a-f-]{36}$/.test(id)) throw new HttpError(400, 'entry')
+  const e = must(await svc.from('logbook_entries').select('id,person_id,topic_id,photo_path').eq('id', id).maybeSingle()) as any
+  if (!e) throw new HttpError(404, 'not_found')
+  if (e.person_id !== u.id) throw new HttpError(403, 'not_yours')
+  return e
+}
+async function editEntry(u: { id: number }, b: any) {
+  const e = await ownEntry(u, b)
+  const body = clean(b?.text, 4000)
+  if (!body) throw new HttpError(400, 'empty')
+  const t = must(await svc.from('logbook_topics').select('has_amount').eq('id', e.topic_id).maybeSingle()) as any
+  let amount: number | null = null
+  if (t?.has_amount && b?.amount !== null && b?.amount !== undefined && b?.amount !== '') {
+    amount = Math.round(Number(b.amount) * 100) / 100
+    if (!isFinite(amount) || amount < 0 || amount > 99999999) throw new HttpError(400, 'amount')
+  }
+  must(await svc.from('logbook_entries').update({ body, amount, edited_at: new Date().toISOString() }).eq('id', e.id).eq('person_id', u.id))
+  return { ok: true }
+}
+async function deleteEntry(u: { id: number }, b: any) {
+  const e = await ownEntry(u, b)
+  // other people's comments are theirs: an entry someone else commented on can be edited, not deleted
+  const { count } = await svc.from('logbook_comments').select('id', { count: 'exact', head: true }).eq('entry_id', e.id).neq('person_id', u.id)
+  if ((count ?? 0) > 0) throw new HttpError(409, 'has_comments')
+  must(await svc.from('logbook_comments').delete().eq('entry_id', e.id))
+  must(await svc.from('logbook_entries').delete().eq('id', e.id).eq('person_id', u.id))
+  if (e.photo_path) await svc.storage.from(BUCKET).remove([e.photo_path])
+  return { ok: true }
+}
+
 // a PIN anyone could guess is refused: same digit 4 times, straight runs up or down
 function weakPin(p: string) {
   if (/^(\d)\1{3}$/.test(p)) return true
@@ -172,14 +208,19 @@ Deno.serve(async req => {
     else {
       const u = await auth(req)
       switch (b.op) {
-        case 'state': out = { me: u.name, choosePin: !u.pinChosen, ...(await state()) }; break
+        case 'state': out = { me: u.name, choosePin: !u.pinChosen, ...(await state(u.id)) }; break
         case 'set_pin': out = await setPin(u, b); break
         case 'add_entry': out = await addEntry(u, b); break
+        case 'edit_entry': out = await editEntry(u, b); break
+        case 'delete_entry': out = await deleteEntry(u, b); break
         case 'add_comment': out = await addComment(u, b); break
         case 'add_topic': out = await addTopic(u, b); break
         case 'logout': await svc.from('logbook_sessions').update({ revoked_at: new Date().toISOString() }).eq('id', u.session); out = { ok: true }; break
         default: throw new HttpError(400, 'op')
       }
+      // 1.3: after a change the fresh logbook comes back in the same answer (one call instead of two)
+      if (['add_entry', 'edit_entry', 'delete_entry', 'add_comment', 'add_topic'].includes(b.op))
+        out = { ...(out as object), state: { me: u.name, choosePin: !u.pinChosen, ...(await state(u.id)) } }
     }
     return new Response(JSON.stringify(out), { headers: H })
   } catch (e) {
